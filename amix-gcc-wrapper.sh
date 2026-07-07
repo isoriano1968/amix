@@ -22,6 +22,17 @@ trap cleanup EXIT INT TERM
 
 fix_asm()
 {
+	# SGS ".swbeg &N" (emitted before every switch jump table) occupies
+	# 4 bytes under the native SGS assembler, and gcc's dispatch is
+	# hard-coded around that: "jmp 6(%pc,%d0.w)" expects the table at
+	# ext-word+6 = jmp-end+4.  GNU as parses .swbeg but emits ZERO
+	# bytes, so every switch case is entered 4 bytes late, skipping its
+	# first instruction(s) and branching on stale condition codes.
+	# Replace .swbeg with an explicit 4-byte filler to restore the
+	# layout the compiler assumed.  (Found via amix-packagemanager
+	# contents-fsck: validate_rest's switch misdispatched on the box.)
+	perl -pi -e 's/^(\s*)\.swbeg\s+&(\d+)[ \t]*$/$1.long $2/' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
 	perl -0pi -e '
 		sub split_operands {
