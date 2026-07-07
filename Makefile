@@ -64,9 +64,32 @@ TARGET_RANLIB := $(PREFIX)/bin/$(TARGET)-ranlib
 GCC_LIBDIR := $(PREFIX)/lib/gcc-lib/$(TARGET)/$(GCC_VERSION)
 GCC_REAL := $(PREFIX)/bin/$(TARGET)-gcc.real
 
-.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper env test-random test-hello print-vars clean distclean
+# Host ar/ranlib the target ar/ranlib wrappers delegate to (see
+# amix-ar-wrapper.sh and install-target-ar).
+HOST_AR ?= ar
+HOST_RANLIB ?= ranlib
 
-all: install-binutils sysroot install-gcc install-gcc-wrapper env
+# Target libgcc: the freestanding libgcc2 helper routines built from the GCC
+# 2.7.2.3 source and archived into libgcc.a.  These are the soft-arithmetic
+# helpers gcc emits calls to (chiefly the 64-bit DImode integer routines such
+# as __udivdi3/__umoddi3/__lshrdi3) plus the DImode<->float conversions.  Every
+# routine here is freestanding: it builds and links with no AMIX libc.  Built
+# one object per function with -DL<name>, mirroring the stock gcc LIB2FUNCS
+# rule, but through the installed wrapper compiler so the SGS->GNU-as fixups are
+# applied.  (float->unsigned and XFmode fix routines are intentionally omitted:
+# GNU as 2.8.1 rejects their fcmp operand syntax; they are not needed here.)
+LIBGCC_A := $(GCC_LIBDIR)/libgcc.a
+LIBGCC2_BUILD_DIR := $(GCC_BUILD)/amix-libgcc
+LIBGCC2_BUILD_CFLAGS ?= -O2
+LIBGCC2_BUILD_INCLUDES := -I$(GCC_BUILD) -I$(GCC_SRC) -I$(GCC_SRC)/config -I$(GCC_SRC)/ginclude
+LIBGCC2_FUNCS := _muldi3 _divdi3 _moddi3 _udivdi3 _umoddi3 _negdi2 \
+	_lshrdi3 _ashldi3 _ashrdi3 _udiv_w_sdiv _udivmoddi4 _cmpdi2 _ucmpdi2 \
+	_floatdidf _floatdisf _floatdixf _fixunsdfdi _fixdfdi _fixunssfdi \
+	__gcc_bcmp _clear_cache _shtab _trampoline
+
+.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 print-vars clean distclean
+
+all: install-binutils sysroot install-gcc install-gcc-wrapper install-target-ar install-libgcc env
 
 help:
 	@echo "AMIX cross-toolchain bootstrap"
@@ -335,6 +358,62 @@ install-gcc-wrapper: install-gcc
 	sed 's/@TARGET@/$(TARGET)/g' $(HERE)/amix-gcc-wrapper.sh > $(PREFIX)/bin/$(TARGET)-gcc
 	chmod 755 $(PREFIX)/bin/$(TARGET)-gcc
 
+# Replace the fortify-aborting binutils 2.8.1 ar/ranlib with thin wrappers that
+# delegate to the host ar/ranlib (see amix-ar-wrapper.sh for the rationale).
+# The shipped ar/ranlib are hardlinked to $(TARGET)/bin/ar etc., so remove the
+# target path first to break the link before writing the wrapper in its place.
+# Self-contained (the wrappers only need the host ar/ranlib); `all' sequences
+# this after install-binutils so it overwrites the binutils-installed ar.
+install-target-ar:
+	@hostar="$$(command -v $(HOST_AR) 2>/dev/null)"; \
+	hostranlib="$$(command -v $(HOST_RANLIB) 2>/dev/null)"; \
+	test -n "$$hostar" || { echo "Host '$(HOST_AR)' not found in PATH"; exit 1; }; \
+	test -n "$$hostranlib" || { echo "Host '$(HOST_RANLIB)' not found in PATH"; exit 1; }; \
+	mkdir -p "$(PREFIX)/bin"; \
+	for tool in ar ranlib; do \
+		dest="$(PREFIX)/bin/$(TARGET)-$$tool"; \
+		sed -e 's/@TARGET@/$(TARGET)/g' \
+		    -e "s|@HOST_AR@|$$hostar|g" \
+		    -e "s|@HOST_RANLIB@|$$hostranlib|g" \
+		    "$(HERE)/amix-ar-wrapper.sh" > "$$dest.amix-tmp"; \
+		rm -f "$$dest"; \
+		mv "$$dest.amix-tmp" "$$dest"; \
+		chmod 755 "$$dest"; \
+		echo "Installed $$dest (delegates to host $$tool)"; \
+	done
+
+# Build libgcc.a from the freestanding libgcc2 helper routines.  One object per
+# function (-DL<name>), compiled through the installed wrapper compiler so the
+# assembler fixups apply, then archived with the (now working) target ar.
+# libgcc2's soft-arithmetic helpers are freestanding, so this needs no AMIX
+# sysroot/libc; it only requires the wrapper compiler + working ar to be
+# installed already.  `all' sequences install-gcc-wrapper before this; the
+# guards below give a clear error if libgcc is built before that.
+libgcc: install-target-ar
+	@test -f "$(GCC_SRC)/libgcc2.c" || { echo "Missing $(GCC_SRC)/libgcc2.c; run 'make extract'"; exit 1; }
+	@test -f "$(GCC_BUILD)/tm.h" || { echo "Missing $(GCC_BUILD)/tm.h; run 'make install-gcc' first"; exit 1; }
+	@grep -q 'amix gcc wrapper' "$(TARGET_CC)" 2>/dev/null || { \
+		echo "$(TARGET_CC) is not the AMIX wrapper compiler; run 'make install-gcc-wrapper' first"; exit 1; }
+	rm -rf $(LIBGCC2_BUILD_DIR)
+	mkdir -p $(LIBGCC2_BUILD_DIR)
+	@set -e; objs=""; \
+	for name in $(LIBGCC2_FUNCS); do \
+		echo "libgcc2: $$name"; \
+		PATH="$(PATH_FOR_BUILD)" "$(TARGET_CC)" $(LIBGCC2_BUILD_CFLAGS) $(LIBGCC2_BUILD_INCLUDES) \
+			-DL$$name -c "$(GCC_SRC)/libgcc2.c" -o "$(LIBGCC2_BUILD_DIR)/$$name.o"; \
+		objs="$$objs $$name.o"; \
+	done; \
+	cd "$(LIBGCC2_BUILD_DIR)" && rm -f libgcc.a && \
+		"$(TARGET_AR)" rc libgcc.a $$objs && \
+		"$(TARGET_RANLIB)" libgcc.a
+	@echo "Built $(LIBGCC2_BUILD_DIR)/libgcc.a"
+
+install-libgcc: libgcc
+	mkdir -p $(GCC_LIBDIR)
+	cp $(LIBGCC2_BUILD_DIR)/libgcc.a $(LIBGCC_A)
+	"$(TARGET_RANLIB)" $(LIBGCC_A)
+	@echo "Installed $(LIBGCC_A)"
+
 env:
 	@mkdir -p $(BUILDDIR)
 	@printf '%s\n' '# Source this file before cross-compiling for AMIX.' > $(BUILDDIR)/env.sh
@@ -362,6 +441,28 @@ test-hello: all check-runtime
 	printf '%s\n' '#include <stdio.h>' 'int main(void) { puts("hello from AMIX cross"); return 0; }' > $(BUILDDIR)/test/hello.c
 	AMIX_SYSROOT="$(SYSROOT)" AMIX_CRT_DIR="$(AMIX_CRT_DIR)" $(TARGET_CC) $(CPUFLAGS) -o $(BUILDDIR)/test/hello $(BUILDDIR)/test/hello.c
 	file $(BUILDDIR)/test/hello
+
+# End-to-end proof that a program using 64-bit integer arithmetic both
+# compiles and links: the division/modulo/shift below force calls to
+# __udivdi3/__umoddi3/__lshrdi3, which must resolve from the installed
+# libgcc.a.  Requires the AMIX crt objects + libc.so.1 in the sysroot (like
+# test-hello).  A successful link with no unresolved symbols is the proof.
+test-uint64: install-libgcc env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Forces the 64-bit soft-integer helpers __udivdi3/__umoddi3/__lshrdi3. */' \
+		'unsigned long long udiv(unsigned long long a, unsigned long long b) { return a / b; }' \
+		'unsigned long long umod(unsigned long long a, unsigned long long b) { return a % b; }' \
+		'unsigned long long shr (unsigned long long a, int n)                { return a >> n; }' \
+		'int main(void) {' \
+		'	return (int)(udiv(1000000000000ULL, 7ULL) + umod(1000003ULL, 7ULL)' \
+		'	           + shr((unsigned long long) 1 << 40, 8));' \
+		'}' \
+		> $(BUILDDIR)/test/uint64.c
+	$(TARGET_CC) $(CPUFLAGS) -o $(BUILDDIR)/test/uint64 $(BUILDDIR)/test/uint64.c
+	file $(BUILDDIR)/test/uint64
+	@echo "64-bit helpers pulled from libgcc.a (expect T, defined):"
+	$(PREFIX)/bin/$(TARGET)-nm $(BUILDDIR)/test/uint64 | grep -E '__udivdi3|__umoddi3|__lshrdi3'
 
 clean:
 	rm -rf $(BUILDDIR)

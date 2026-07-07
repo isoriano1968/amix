@@ -202,11 +202,24 @@ for src in "${sources[@]}"; do
 	objects+=("$obj")
 done
 
+# Locate the installed target libgcc.a (the freestanding soft-arithmetic
+# helpers: 64-bit __udivdi3/__umoddi3/__lshrdi3/... and the DImode<->float
+# conversions).  A stock gcc driver pulls this in via -lgcc from its specs, but
+# this wrapper hand-rolls the ld command line, so add libgcc.a explicitly.  The
+# newest installed version directory wins; if none is present the link proceeds
+# without it, preserving the previous behaviour.
+libgcc_a=
+for cand in "$prefix"/lib/gcc-lib/"$target"/*/libgcc.a; do
+	test -f "$cand" && libgcc_a="$cand"
+done
+
 resolved_libs=()
 if test "${#libs[@]}" -eq 0; then
 	libs=(c)
 fi
 for lib in "${libs[@]}"; do
+	# -lgcc is satisfied by the libgcc.a appended to the link below.
+	test "$lib" = gcc && continue
 	resolved_libs+=("$(resolve_lib "$lib")")
 done
 
@@ -217,7 +230,13 @@ for crt in crt1.o crti.o crtn.o; do
 	}
 done
 
+# libgcc.a goes LAST (after the user's libraries, before crtn): it is a leaf
+# dependency, so any preceding static archive whose members reference the 64-bit
+# helpers must come before it for single-pass ld to resolve them.  This mirrors
+# a stock gcc driver, which appends -lgcc at the end of the link.
 exec "$ld" -o "$out" \
 	"$crt_dir/crt1.o" "$crt_dir/crti.o" \
-	"${objects[@]}" "${ld_flags[@]}" "${resolved_libs[@]}" \
+	"${objects[@]}" "${ld_flags[@]}" \
+	"${resolved_libs[@]}" \
+	${libgcc_a:+"$libgcc_a"} \
 	"$crt_dir/crtn.o"
