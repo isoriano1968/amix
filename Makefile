@@ -87,7 +87,7 @@ LIBGCC2_FUNCS := _muldi3 _divdi3 _moddi3 _udivdi3 _umoddi3 _negdi2 \
 	_floatdidf _floatdisf _floatdixf _fixunsdfdi _fixdfdi _fixunssfdi \
 	__gcc_bcmp _clear_cache _shtab _trampoline
 
-.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 print-vars clean distclean
+.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod print-vars clean distclean
 
 all: install-binutils sysroot install-gcc install-gcc-wrapper install-target-ar install-libgcc env
 
@@ -463,6 +463,52 @@ test-uint64: install-libgcc env
 	file $(BUILDDIR)/test/uint64
 	@echo "64-bit helpers pulled from libgcc.a (expect T, defined):"
 	$(PREFIX)/bin/$(TARGET)-nm $(BUILDDIR)/test/uint64 | grep -E '__udivdi3|__umoddi3|__lshrdi3'
+
+# Regression test for the SGS "tdivs.l/tdivu.l <ea>,%dR:%dQ" assembler fixup
+# (see fix_asm in amix-gcc-wrapper.sh).  gcc emits the 68020 32/32 divide-with-
+# remainder for every variable-divisor "%"/"/"; GNU as 2.8.1 mis-assembles the
+# raw SGS spelling as the 64-bit-dividend "DIVS.L Dr:Dq" (SIZE bit set), which
+# overflows and leaves the operands unchanged -> wrong results.  The wrapper
+# rewrites it to "divsl.l"/"divul.l" (32-bit dividend, 32r:32q).  This target
+# compiles signed+unsigned "%"/"/" through the installed wrapper at both the
+# -O0 and -O register shapes and checks the *object code*: every emitted divide
+# must disassemble as the 32-bit-dividend form ("divsll"/"divull", SIZE clear,
+# both registers preserved) and NONE as the broken 64-bit form ("divsl"/"divul").
+#
+# Failure mode against the PRE-FIX wrapper (proof this test bites): the modulo
+# ops assemble to the 64-bit "divsl"/"divul" form, so the "no broken form" check
+# below fails; at -O0 the divides do too, so the "correct form present" check
+# also fails.  A pass therefore requires the fixup to be installed.
+test-divmod: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Variable-divisor signed+unsigned % and / force gcc to emit the' \
+		'   68020 32/32 divide-with-remainder (SGS tdivs.l/tdivu.l ea,%dR:%dQ).' \
+		'   Known answers on target: smod/umod(351,151)=49, sdiv/udiv(351,151)=2.' \
+		'   The objdump check in the Makefile is what actually gates the test. */' \
+		'int          smod(int a, int b)                   { return a % b; }' \
+		'unsigned int umod(unsigned int a, unsigned int b) { return a % b; }' \
+		'int          sdiv(int a, int b)                   { return a / b; }' \
+		'unsigned int udiv(unsigned int a, unsigned int b) { return a / b; }' \
+		'int main(void) {' \
+		'	return smod(351,151) + (int)umod(351u,151u)' \
+		'	     + sdiv(351,151) + (int)udiv(351u,151u); /* = 102 */' \
+		'}' \
+		> $(BUILDDIR)/test/divmod.c
+	@set -e; status=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/divmod$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/divmod.c; \
+		dis="$$($(PREFIX)/bin/$(TARGET)-objdump -d "$$obj")"; \
+		echo "==== $$opt ===="; echo "$$dis" | grep -Ew 'divsl|divul|divsll|divull' || true; \
+		if ! printf '%s\n' "$$dis" | grep -Ewq 'divsll|divull'; then \
+			echo "FAIL$$opt: no 32-bit-dividend divide (divsll/divull) emitted"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Ewq 'divsl|divul'; then \
+			echo "FAIL$$opt: broken 64-bit-dividend form (divsl/divul) still emitted"; status=1; \
+		fi; \
+	done; \
+	test $$status -eq 0 && echo "test-divmod PASS: both registers preserved, no 64-bit-dividend form"
 
 clean:
 	rm -rf $(BUILDDIR)

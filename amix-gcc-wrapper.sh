@@ -33,6 +33,27 @@ fix_asm()
 	# contents-fsck: validate_rest's switch misdispatched on the box.)
 	perl -pi -e 's/^(\s*)\.swbeg\s+&(\d+)[ \t]*$/$1.long $2/' "$1"
 
+	# gcc's SGS output spells the 68020 32-bit/32-bit divide-with-
+	# remainder as "tdivs.l <ea>,%dR:%dQ" / "tdivu.l ..." (remainder in
+	# dR, quotient in dQ).  These SGS mnemonics are produced by
+	# config/m68k/sgs.h, which renames the Motorola "divsl"/"divul" to
+	# "tdivs"/"tdivu".  GNU as 2.8.1 does not know them as the 32-bit-
+	# dividend form: it assembles "tdivs.l <ea>,%dR:%dQ" to the SAME
+	# encoding as "divs.l <ea>,%dR:%dQ", i.e. the 64-bit-dividend
+	# "DIVS.L Dr:Dq" (SIZE bit set), so dR is taken as the HIGH 32 bits
+	# of the dividend instead of the remainder destination.  That word
+	# holds an unrelated value, the 64-bit quotient overflows 32 bits,
+	# and the 68020 then leaves the operand registers UNCHANGED -- so
+	# both "%" and "/" on a variable divisor return garbage (measured:
+	# 351 % 151 -> -2147408448, 351 / 151 -> 351).  Undo the SGS rename
+	# back to the Motorola/GNU-as "divsl.l"/"divul.l" (32-bit dividend,
+	# 32r:32q) spelling, which assembles to the correct SIZE-clear
+	# encoding with the remainder in dR and the quotient in dQ.  Verify
+	# with objdump: the fixed form disassembles as "divsll"/"divull",
+	# the broken one as "divsl"/"divul".  (Affects every variable-divisor
+	# divide/modulo the compiler emits, at both -O0 and -O.)
+	perl -pi -e 's/^(\s*)tdivs(?=[.\s])/${1}divsl/; s/^(\s*)tdivu(?=[.\s])/${1}divul/;' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
 	perl -0pi -e '
 		sub split_operands {
