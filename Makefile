@@ -87,7 +87,7 @@ LIBGCC2_FUNCS := _muldi3 _divdi3 _moddi3 _udivdi3 _umoddi3 _negdi2 \
 	_floatdidf _floatdisf _floatdixf _fixunsdfdi _fixdfdi _fixunssfdi \
 	__gcc_bcmp _clear_cache _shtab _trampoline
 
-.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod print-vars clean distclean
+.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod test-float print-vars clean distclean
 
 all: install-binutils sysroot install-gcc install-gcc-wrapper install-target-ar install-libgcc env
 
@@ -509,6 +509,78 @@ test-divmod: install-gcc-wrapper env
 		fi; \
 	done; \
 	test $$status -eq 0 && echo "test-divmod PASS: both registers preserved, no 64-bit-dividend form"
+
+# Regression test for the SGS "fsgldiv.s/fsglmul.s %fpN,%fpM" assembler fixup
+# (see fix_asm in amix-gcc-wrapper.sh).  gcc spells single-precision FP multiply
+# and divide as the 68881/68882 "fsglmul"/"fsgldiv"; config/m68k/amix.h defines
+# FSGLMUL_USE_S/FSGLDIV_USE_S, so the REGISTER-TO-REGISTER form comes out with an
+# SGS ".s" suffix.  GNU as 2.8.1 requires ".x" there: with both operands in FPU
+# registers the data is 80-bit extended by definition, and the single-precision
+# rounding is encoded in the "sgl" of the mnemonic, not in the suffix.
+#
+# This target compiles float "/" and "*" through the installed wrapper at both
+# -O0 and -O and checks the *object code* for BOTH halves of the fix:
+#   (a) the register-to-register ops became the ".x" form, i.e. they disassemble
+#       as "fsgldivx %fpN,%fpM" / "fsglmulx %fpN,%fpM"; and
+#   (b) the legal single-precision NON-register-source ops were NOT touched --
+#       a memory source ("fsgldivs %fp@(N),%fpM") and a data-register source
+#       ("fsglmuls %dN,%fpM") are both valid and encode a genuinely different
+#       instruction (R/M=1, source format "single") from the ".x" register form
+#       (R/M=0), so rewriting them would be a miscompile.  gcc emits all three
+#       shapes from the source below.
+#
+# Failure mode against the PRE-FIX wrapper (proof this test bites): it fails at
+# ASSEMBLY time, before any objdump check runs --
+#   Error: operands mismatch -- statement `fsgldiv.s %fp1,%fp0' ignored
+# which is exactly why cross-building C that divides or multiplies "float"
+# previously needed a -Dfloat=double workaround.  A too-greedy rewrite that also
+# hit the memory/data-register forms fails check (b) instead.
+test-float: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Single-precision multiply/divide in three operand shapes.' \
+		'   rr_*  : both operands end up in FPU registers -- the form GNU as' \
+		'           rejects when it carries the SGS ".s" suffix (the bug).' \
+		'   mem_* : single-precision MEMORY source -- ".s" is legal and must' \
+		'           NOT be rewritten.' \
+		'   dreg  : single-precision DATA-REGISTER source -- likewise legal.' \
+		'   Deliberately no float COMPARISONS: gcc emits fcmp with SGS-reversed' \
+		'   operands, a separate defect that this target does not cover. */' \
+		'float rr_div (float a, float b) { float t = a + b; return (a * t) / (b * t); }' \
+		'float rr_mul (float a, float b) { float t = a + b; return (a * t) * (b * t); }' \
+		'float mem_div(float a, float b) { return a / b; }' \
+		'float mem_mul(float a, float b) { return a * b; }' \
+		'float dreg   (float a, float b) { return (a * b) * (a + b); }' \
+		'int main(void) { return (int)(rr_div(6.0f, 3.0f) + rr_mul(1.0f, 1.0f)' \
+		'                            + mem_div(8.0f, 4.0f) + mem_mul(2.0f, 3.0f)' \
+		'                            + dreg(1.0f, 2.0f)); }' \
+		> $(BUILDDIR)/test/float.c
+	@set -e; status=0; sawdreg=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/float$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/float.c; \
+		dis="$$($(PREFIX)/bin/$(TARGET)-objdump -d "$$obj")"; \
+		echo "==== $$opt ===="; \
+		printf '%s\n' "$$dis" | grep -oE 'fsgl(div|mul)[sx][ \t]+[^ ]+' | sort | uniq -c || true; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsgldivx[ \t]+%fp[0-7],%fp[0-7]'; then \
+			echo "FAIL$$opt: no register-to-register fsgldiv in the .x form"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsglmulx[ \t]+%fp[0-7],%fp[0-7]'; then \
+			echo "FAIL$$opt: no register-to-register fsglmul in the .x form"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsgldivs[ \t]+%fp@\('; then \
+			echo "FAIL$$opt: legal memory-source fsgldiv.s was rewritten away"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsglmuls[ \t]+%fp@\('; then \
+			echo "FAIL$$opt: legal memory-source fsglmul.s was rewritten away"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Eq 'fsgl(div|mul)s[ \t]+%fp[0-7],'; then \
+			echo "FAIL$$opt: an FPU-register-source op kept the illegal .s suffix"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Eq 'fsglmuls[ \t]+%d[0-7],%fp[0-7]'; then sawdreg=1; fi; \
+	done; \
+	test $$sawdreg -eq 1 || { echo "FAIL: legal data-register-source fsglmul.s never seen"; status=1; }; \
+	test $$status -eq 0 && echo "test-float PASS: reg-reg fsgl ops are .x, memory/data-register .s forms untouched"
 
 clean:
 	rm -rf $(BUILDDIR)

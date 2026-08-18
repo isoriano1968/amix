@@ -54,7 +54,40 @@ fix_asm()
 	# divide/modulo the compiler emits, at both -O0 and -O.)
 	perl -pi -e 's/^(\s*)tdivs(?=[.\s])/${1}divsl/; s/^(\s*)tdivu(?=[.\s])/${1}divul/;' "$1"
 
+	# gcc emits single-precision FP multiply/divide as the 68881/68882
+	# "fsglmul"/"fsgldiv" (single-precision ROUNDING, extended-precision
+	# operands).  config/m68k/amix.h defines FSGLDIV_USE_S/FSGLMUL_USE_S,
+	# which makes the m68k.md templates spell the register-to-register
+	# form with a ".s" suffix ("fsgldiv.s %fp1,%fp0") the way the native
+	# SGS assembler wants it.  GNU as 2.8.1 disagrees: in its grammar the
+	# suffix names the SOURCE OPERAND FORMAT, and when the source is an
+	# FPU register the data is by definition 80-bit extended, so ".x" is
+	# the only legal suffix on the register-register form.  It rejects the
+	# ".s" spelling outright -- "Error: operands mismatch -- statement
+	# `fsgldiv.s %fp1,%fp0' ignored" -- which blocks assembly of ANY C
+	# using "float" multiply or divide (measured: 15 fsgldiv + 6 fsglmul
+	# rejections in one small float test file at -O).  Both spellings mean
+	# the same instruction: the single-precision rounding is encoded in
+	# the "sgl" of the mnemonic, not in the suffix.  Rewrite to ".x".
+	#
+	# ONLY the register-to-register form may be rewritten.  With a
+	# non-register source the ".s" suffix is load-bearing and legal --
+	# "fsgldiv.s 12(%fp),%fp0" (memory) and "fsgldiv.s %d0,%fp0" (data
+	# register) both assemble, and both encode a genuinely different
+	# instruction (R/M=1, source specifier "single") from the ".x"
+	# register-register form (R/M=0).  gcc emits all three shapes, so the
+	# match below requires BOTH operands to be %fp0-%fp7 registers and
+	# leaves memory/data-register/immediate sources alone.  Verify with
+	# objdump: the rewritten form disassembles as "fsgldivx"/"fsglmulx",
+	# the untouched legal ones stay "fsgldivs"/"fsglmuls".  ("make
+	# test-float" gates both halves.)
+	#
+	# Note the frame pointer prints as "%fp" with no digit, so the
+	# "%fp[0-7]" match cannot mistake "12(%fp)" for an FPU register.
+	perl -pi -e 's{^(\s*)fsgl(div|mul)\.s(\s+%fp[0-7]\s*,\s*%fp[0-7])(\s*)$}{$1fsgl$2.x$3$4}' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
+
 	perl -0pi -e '
 		sub split_operands {
 			my ($s) = @_;
