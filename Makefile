@@ -76,8 +76,12 @@ HOST_RANLIB ?= ranlib
 # routine here is freestanding: it builds and links with no AMIX libc.  Built
 # one object per function with -DL<name>, mirroring the stock gcc LIB2FUNCS
 # rule, but through the installed wrapper compiler so the SGS->GNU-as fixups are
-# applied.  (float->unsigned and XFmode fix routines are intentionally omitted:
-# GNU as 2.8.1 rejects their fcmp operand syntax; they are not needed here.)
+# applied.  (The float->unsigned and XFmode fix routines are omitted because
+# nothing built here needs them.  They also used to be impossible to build at
+# all -- GNU as 2.8.1 rejected the SGS fcmp operand order they emit -- but the
+# compare fixup in fix_asm now handles that, so _fixunsdfsi, _fixunssfsi,
+# _fixunsxfsi, _fixunsxfdi, _fixxfdi and _fixsfdi all compile cleanly should
+# they ever be wanted.)
 LIBGCC_A := $(GCC_LIBDIR)/libgcc.a
 LIBGCC2_BUILD_DIR := $(GCC_BUILD)/amix-libgcc
 LIBGCC2_BUILD_CFLAGS ?= -O2
@@ -87,7 +91,7 @@ LIBGCC2_FUNCS := _muldi3 _divdi3 _moddi3 _udivdi3 _umoddi3 _negdi2 \
 	_floatdidf _floatdisf _floatdixf _fixunsdfdi _fixdfdi _fixunssfdi \
 	__gcc_bcmp _clear_cache _shtab _trampoline
 
-.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod test-float print-vars clean distclean
+.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod test-float test-fcmp print-vars clean distclean
 
 all: install-binutils sysroot install-gcc install-gcc-wrapper install-target-ar install-libgcc env
 
@@ -544,8 +548,8 @@ test-float: install-gcc-wrapper env
 		'   mem_* : single-precision MEMORY source -- ".s" is legal and must' \
 		'           NOT be rewritten.' \
 		'   dreg  : single-precision DATA-REGISTER source -- likewise legal.' \
-		'   Deliberately no float COMPARISONS: gcc emits fcmp with SGS-reversed' \
-		'   operands, a separate defect that this target does not cover. */' \
+		'   Deliberately no float COMPARISONS: the SGS fcmp operand order is a' \
+		'   separate fixup with its own gate, "make test-fcmp". */' \
 		'float rr_div (float a, float b) { float t = a + b; return (a * t) / (b * t); }' \
 		'float rr_mul (float a, float b) { float t = a + b; return (a * t) * (b * t); }' \
 		'float mem_div(float a, float b) { return a / b; }' \
@@ -581,6 +585,77 @@ test-float: install-gcc-wrapper env
 	done; \
 	test $$sawdreg -eq 1 || { echo "FAIL: legal data-register-source fsglmul.s never seen"; status=1; }; \
 	test $$status -eq 0 && echo "test-float PASS: reg-reg fsgl ops are .x, memory/data-register .s forms untouched"
+
+# Regression test for the SGS compare-operand-order fixup as it applies to the
+# 68881 "fcmp" (see fix_asm in amix-gcc-wrapper.sh).  config/m68k/sgs.h defines
+# SGS_CMP_ORDER, so gcc prints both compare operands the other way round from
+# what GNU as expects.  The wrapper swaps them back.  Two distinct failure modes
+# hide behind this, and this target has to catch BOTH:
+#
+#   FP register vs memory  -- GNU as needs an FPU register as the DESTINATION,
+#     so the SGS spelling is rejected outright and the build stops:
+#       Error: operands mismatch -- statement `fcmp.d %fp0,16(%fp)' ignored
+#
+#   FP register vs FP register -- the reversed spelling is still VALID syntax,
+#     so it assembles silently to a different encoding ("fcmp.x %fp2,%fp0" is
+#     f200 0838, "fcmp.x %fp0,%fp2" is f200 0138).  FCMP computes destination
+#     minus source, so the wrong order makes every following fbgt/fsgt test the
+#     REVERSED relation, with no diagnostic anywhere.  Same severity class as
+#     the tdivs defect: cross-built code that looks fine and computes garbage.
+#
+# Checking the sense mechanically, without being able to RUN the code, needs an
+# invariant that does not depend on register allocation or stack offsets.  Each
+# function below compares a MULTIPLY result against something else, C-source
+# left-hand side first ("x > y" where x = a * b).  Because FCMP computes
+# <second operand> minus <first operand>, a correctly ordered fcmp must name the
+# register holding the multiply result as its SECOND operand.  So the invariant
+# is simply: the destination of the fcmp is the register the fmul wrote.  That
+# holds at -O0 (values reloaded from the stack) and at -O (values kept in FPU
+# registers) alike, and it is exactly what breaks when the operands are reversed.
+#
+# Failure mode against a wrapper WITHOUT the fcmp half of the fixup (proof this
+# test bites): rm_* fail to assemble with the "operands mismatch" above, and the
+# rr_* pair assemble cleanly but report the fcmp destination as the fadd result
+# rather than the fmul result -- a MISMATCH line and a non-zero exit.
+test-fcmp: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Every comparison puts a MULTIPLY result on the left of ">", so a' \
+		'   correctly ordered fcmp must carry that register as its SECOND' \
+		'   operand (FCMP computes second minus first).' \
+		'   rr_* keep both values in FPU registers -> the SILENT failure shape.' \
+		'   rm_* compare against a memory operand   -> the LOUD failure shape. */' \
+		'int rr_d(double a, double b){ double x = a * b, y = a + b; return x > y; }' \
+		'int rr_f(float  a, float  b){ float  x = a * b, y = a + b; return x > y; }' \
+		'int rm_d(double a, double b){ double x = a * b;            return x > b; }' \
+		'int rm_f(float  a, float  b){ float  x = a * b;            return x > b; }' \
+		'int main(void) { return rr_d(3.0, 2.0) + rr_f(3.0f, 2.0f)' \
+		'                      + rm_d(3.0, 2.0) + rm_f(3.0f, 2.0f); }' \
+		> $(BUILDDIR)/test/fcmp.c
+	@set -e; status=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/fcmp$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/fcmp.c; \
+		echo "==== $$opt ===="; \
+		$(PREFIX)/bin/$(TARGET)-objdump -d "$$obj" | awk ' \
+			/^[0-9a-f]+ <.*>:/ { fn=$$2; gsub(/[<>:]/,"",fn); mul=""; next } \
+			/f(sgl)?mul[sdx]/  { n=split($$0,p,","); mul=p[n]; sub(/[ \t]+$$/,"",mul) } \
+			/fcmp[sdx]/ { \
+				n=split($$0,p,","); d=p[n]; sub(/[ \t]+$$/,"",d); \
+				src=$$0; sub(/.*fcmp[sdx][ \t]+/,"",src); sub(/,.*/,"",src); \
+				if (mul == "" || d != mul) { \
+					printf "  FAIL %s: fcmp destination %s is not the fmul result %s (comparison reversed)\n", fn, d, mul; bad=1 \
+				} else { \
+					printf "  ok   %s: fcmp %s,%s computes (fmul result %s) - src\n", fn, src, d, d \
+				} \
+				seen++ \
+			} \
+			END { \
+				if (seen != 4) { printf "  FAIL: expected 4 fcmp sites, saw %d\n", seen; bad=1 } \
+				exit bad ? 1 : 0 \
+			}' || status=1; \
+	done; \
+	test $$status -eq 0 && echo "test-fcmp PASS: compare operands in GNU order, branch sense matches the C source"
 
 clean:
 	rm -rf $(BUILDDIR)

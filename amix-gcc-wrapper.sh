@@ -88,6 +88,40 @@ fix_asm()
 
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
 
+	# Restore Motorola/GNU operand order for compares.  config/m68k/sgs.h
+	# defines SGS_CMP_ORDER ("Takes cmp operands in reverse order"), so
+	# every compare template in config/m68k/m68k.md prints its two
+	# operands the other way round from what GNU as expects.
+	#
+	# This covers the integer "cmp.[bwl]" AND the 68881 "fcmp.[sdx]".
+	# For fcmp the m68k.md patterns have three branches, and in all three
+	# -- across SFmode, DFmode and XFmode -- the SGS template is the exact
+	# operand-swap of the non-SGS template, with cc_status set identically
+	# in both.  So swapping the two printed operands is enough; the
+	# condition-code sense gcc assumed is preserved untouched:
+	#
+	#   both operands FPU regs   SGS "fcmp.x %0,%1"   GNU "fcmp.x %1,%0"
+	#   FP reg vs memory/dreg    SGS "fcmp.s %0,%f1"  GNU "fcmp.s %f1,%0"
+	#   memory/dreg vs FP reg    SGS "fcmp.s %1,%f0"  GNU "fcmp.s %f0,%1"
+	#
+	# The two shapes fail differently, and one of them fails SILENTLY.
+	# GNU as requires an FPU register as the DESTINATION, so the forms
+	# with memory on the right are rejected outright ("operands mismatch
+	# -- statement `fcmp.d %fp0,16(%fp)' ignored").  But when BOTH
+	# operands are FPU registers the reversed spelling is still valid
+	# syntax and assembles silently to a DIFFERENT encoding: "fcmp.x
+	# %fp2,%fp0" is f200 0838 (source fp2, destination fp0) whereas
+	# "fcmp.x %fp0,%fp2" is f200 0138.  FCMP computes destination minus
+	# source, so the unswapped form compares the operands the wrong way
+	# round and the following fbgt/fsgt tests the REVERSED relation --
+	# e.g. a "secs > 0.0" guard in cross-built code evaluates as
+	# "0.0 > secs".  Verify with objdump: FCMP computes <second operand>
+	# minus <first operand>, so the value the C source has on the LEFT of
+	# the comparison must end up as the SECOND operand.  ("make test-fcmp"
+	# gates both shapes.)
+	#
+	# The split is parenthesis-aware because memory operands contain
+	# commas of their own, e.g. "fcmp.s 4(%a0,%d0.l),%fp1".
 	perl -0pi -e '
 		sub split_operands {
 			my ($s) = @_;
@@ -102,7 +136,7 @@ fix_asm()
 			}
 			return;
 		}
-		s{^(\s*cmp\.[bwl]\s+)([^\n]+)$}{
+		s{^(\s*(?:cmp\.[bwl]|fcmp\.[bwlsdxp])\s+)([^\n]+)$}{
 			my ($prefix, $ops) = ($1, $2);
 			my ($left, $right) = split_operands($ops);
 			defined $right ? "$prefix$right,$left" : "$prefix$ops";
