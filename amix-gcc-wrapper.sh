@@ -22,7 +22,106 @@ trap cleanup EXIT INT TERM
 
 fix_asm()
 {
+	# SGS ".swbeg &N" (emitted before every switch jump table) occupies
+	# 4 bytes under the native SGS assembler, and gcc's dispatch is
+	# hard-coded around that: "jmp 6(%pc,%d0.w)" expects the table at
+	# ext-word+6 = jmp-end+4.  GNU as parses .swbeg but emits ZERO
+	# bytes, so every switch case is entered 4 bytes late, skipping its
+	# first instruction(s) and branching on stale condition codes.
+	# Replace .swbeg with an explicit 4-byte filler to restore the
+	# layout the compiler assumed.  (Found via amix-packagemanager
+	# contents-fsck: validate_rest's switch misdispatched on the box.)
+	perl -pi -e 's/^(\s*)\.swbeg\s+&(\d+)[ \t]*$/$1.long $2/' "$1"
+
+	# gcc's SGS output spells the 68020 32-bit/32-bit divide-with-
+	# remainder as "tdivs.l <ea>,%dR:%dQ" / "tdivu.l ..." (remainder in
+	# dR, quotient in dQ).  These SGS mnemonics are produced by
+	# config/m68k/sgs.h, which renames the Motorola "divsl"/"divul" to
+	# "tdivs"/"tdivu".  GNU as 2.8.1 does not know them as the 32-bit-
+	# dividend form: it assembles "tdivs.l <ea>,%dR:%dQ" to the SAME
+	# encoding as "divs.l <ea>,%dR:%dQ", i.e. the 64-bit-dividend
+	# "DIVS.L Dr:Dq" (SIZE bit set), so dR is taken as the HIGH 32 bits
+	# of the dividend instead of the remainder destination.  That word
+	# holds an unrelated value, the 64-bit quotient overflows 32 bits,
+	# and the 68020 then leaves the operand registers UNCHANGED -- so
+	# both "%" and "/" on a variable divisor return garbage (measured:
+	# 351 % 151 -> -2147408448, 351 / 151 -> 351).  Undo the SGS rename
+	# back to the Motorola/GNU-as "divsl.l"/"divul.l" (32-bit dividend,
+	# 32r:32q) spelling, which assembles to the correct SIZE-clear
+	# encoding with the remainder in dR and the quotient in dQ.  Verify
+	# with objdump: the fixed form disassembles as "divsll"/"divull",
+	# the broken one as "divsl"/"divul".  (Affects every variable-divisor
+	# divide/modulo the compiler emits, at both -O0 and -O.)
+	perl -pi -e 's/^(\s*)tdivs(?=[.\s])/${1}divsl/; s/^(\s*)tdivu(?=[.\s])/${1}divul/;' "$1"
+
+	# gcc emits single-precision FP multiply/divide as the 68881/68882
+	# "fsglmul"/"fsgldiv" (single-precision ROUNDING, extended-precision
+	# operands).  config/m68k/amix.h defines FSGLDIV_USE_S/FSGLMUL_USE_S,
+	# which makes the m68k.md templates spell the register-to-register
+	# form with a ".s" suffix ("fsgldiv.s %fp1,%fp0") the way the native
+	# SGS assembler wants it.  GNU as 2.8.1 disagrees: in its grammar the
+	# suffix names the SOURCE OPERAND FORMAT, and when the source is an
+	# FPU register the data is by definition 80-bit extended, so ".x" is
+	# the only legal suffix on the register-register form.  It rejects the
+	# ".s" spelling outright -- "Error: operands mismatch -- statement
+	# `fsgldiv.s %fp1,%fp0' ignored" -- which blocks assembly of ANY C
+	# using "float" multiply or divide (measured: 15 fsgldiv + 6 fsglmul
+	# rejections in one small float test file at -O).  Both spellings mean
+	# the same instruction: the single-precision rounding is encoded in
+	# the "sgl" of the mnemonic, not in the suffix.  Rewrite to ".x".
+	#
+	# ONLY the register-to-register form may be rewritten.  With a
+	# non-register source the ".s" suffix is load-bearing and legal --
+	# "fsgldiv.s 12(%fp),%fp0" (memory) and "fsgldiv.s %d0,%fp0" (data
+	# register) both assemble, and both encode a genuinely different
+	# instruction (R/M=1, source specifier "single") from the ".x"
+	# register-register form (R/M=0).  gcc emits all three shapes, so the
+	# match below requires BOTH operands to be %fp0-%fp7 registers and
+	# leaves memory/data-register/immediate sources alone.  Verify with
+	# objdump: the rewritten form disassembles as "fsgldivx"/"fsglmulx",
+	# the untouched legal ones stay "fsgldivs"/"fsglmuls".  ("make
+	# test-float" gates both halves.)
+	#
+	# Note the frame pointer prints as "%fp" with no digit, so the
+	# "%fp[0-7]" match cannot mistake "12(%fp)" for an FPU register.
+	perl -pi -e 's{^(\s*)fsgl(div|mul)\.s(\s+%fp[0-7]\s*,\s*%fp[0-7])(\s*)$}{$1fsgl$2.x$3$4}' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
+
+	# Restore Motorola/GNU operand order for compares.  config/m68k/sgs.h
+	# defines SGS_CMP_ORDER ("Takes cmp operands in reverse order"), so
+	# every compare template in config/m68k/m68k.md prints its two
+	# operands the other way round from what GNU as expects.
+	#
+	# This covers the integer "cmp.[bwl]" AND the 68881 "fcmp.[sdx]".
+	# For fcmp the m68k.md patterns have three branches, and in all three
+	# -- across SFmode, DFmode and XFmode -- the SGS template is the exact
+	# operand-swap of the non-SGS template, with cc_status set identically
+	# in both.  So swapping the two printed operands is enough; the
+	# condition-code sense gcc assumed is preserved untouched:
+	#
+	#   both operands FPU regs   SGS "fcmp.x %0,%1"   GNU "fcmp.x %1,%0"
+	#   FP reg vs memory/dreg    SGS "fcmp.s %0,%f1"  GNU "fcmp.s %f1,%0"
+	#   memory/dreg vs FP reg    SGS "fcmp.s %1,%f0"  GNU "fcmp.s %f0,%1"
+	#
+	# The two shapes fail differently, and one of them fails SILENTLY.
+	# GNU as requires an FPU register as the DESTINATION, so the forms
+	# with memory on the right are rejected outright ("operands mismatch
+	# -- statement `fcmp.d %fp0,16(%fp)' ignored").  But when BOTH
+	# operands are FPU registers the reversed spelling is still valid
+	# syntax and assembles silently to a DIFFERENT encoding: "fcmp.x
+	# %fp2,%fp0" is f200 0838 (source fp2, destination fp0) whereas
+	# "fcmp.x %fp0,%fp2" is f200 0138.  FCMP computes destination minus
+	# source, so the unswapped form compares the operands the wrong way
+	# round and the following fbgt/fsgt tests the REVERSED relation --
+	# e.g. a "secs > 0.0" guard in cross-built code evaluates as
+	# "0.0 > secs".  Verify with objdump: FCMP computes <second operand>
+	# minus <first operand>, so the value the C source has on the LEFT of
+	# the comparison must end up as the SECOND operand.  ("make test-fcmp"
+	# gates both shapes.)
+	#
+	# The split is parenthesis-aware because memory operands contain
+	# commas of their own, e.g. "fcmp.s 4(%a0,%d0.l),%fp1".
 	perl -0pi -e '
 		sub split_operands {
 			my ($s) = @_;
@@ -37,7 +136,7 @@ fix_asm()
 			}
 			return;
 		}
-		s{^(\s*cmp\.[bwl]\s+)([^\n]+)$}{
+		s{^(\s*(?:cmp\.[bwl]|fcmp\.[bwlsdxp])\s+)([^\n]+)$}{
 			my ($prefix, $ops) = ($1, $2);
 			my ($left, $right) = split_operands($ops);
 			defined $right ? "$prefix$right,$left" : "$prefix$ops";
@@ -191,11 +290,24 @@ for src in "${sources[@]}"; do
 	objects+=("$obj")
 done
 
+# Locate the installed target libgcc.a (the freestanding soft-arithmetic
+# helpers: 64-bit __udivdi3/__umoddi3/__lshrdi3/... and the DImode<->float
+# conversions).  A stock gcc driver pulls this in via -lgcc from its specs, but
+# this wrapper hand-rolls the ld command line, so add libgcc.a explicitly.  The
+# newest installed version directory wins; if none is present the link proceeds
+# without it, preserving the previous behaviour.
+libgcc_a=
+for cand in "$prefix"/lib/gcc-lib/"$target"/*/libgcc.a; do
+	test -f "$cand" && libgcc_a="$cand"
+done
+
 resolved_libs=()
 if test "${#libs[@]}" -eq 0; then
 	libs=(c)
 fi
 for lib in "${libs[@]}"; do
+	# -lgcc is satisfied by the libgcc.a appended to the link below.
+	test "$lib" = gcc && continue
 	resolved_libs+=("$(resolve_lib "$lib")")
 done
 
@@ -206,7 +318,13 @@ for crt in crt1.o crti.o crtn.o; do
 	}
 done
 
+# libgcc.a goes LAST (after the user's libraries, before crtn): it is a leaf
+# dependency, so any preceding static archive whose members reference the 64-bit
+# helpers must come before it for single-pass ld to resolve them.  This mirrors
+# a stock gcc driver, which appends -lgcc at the end of the link.
 exec "$ld" -o "$out" \
 	"$crt_dir/crt1.o" "$crt_dir/crti.o" \
-	"${objects[@]}" "${ld_flags[@]}" "${resolved_libs[@]}" \
+	"${objects[@]}" "${ld_flags[@]}" \
+	"${resolved_libs[@]}" \
+	${libgcc_a:+"$libgcc_a"} \
 	"$crt_dir/crtn.o"

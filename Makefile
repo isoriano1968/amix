@@ -64,9 +64,36 @@ TARGET_RANLIB := $(PREFIX)/bin/$(TARGET)-ranlib
 GCC_LIBDIR := $(PREFIX)/lib/gcc-lib/$(TARGET)/$(GCC_VERSION)
 GCC_REAL := $(PREFIX)/bin/$(TARGET)-gcc.real
 
-.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper env test-random test-hello print-vars clean distclean
+# Host ar/ranlib the target ar/ranlib wrappers delegate to (see
+# amix-ar-wrapper.sh and install-target-ar).
+HOST_AR ?= ar
+HOST_RANLIB ?= ranlib
 
-all: install-binutils sysroot install-gcc install-gcc-wrapper env
+# Target libgcc: the freestanding libgcc2 helper routines built from the GCC
+# 2.7.2.3 source and archived into libgcc.a.  These are the soft-arithmetic
+# helpers gcc emits calls to (chiefly the 64-bit DImode integer routines such
+# as __udivdi3/__umoddi3/__lshrdi3) plus the DImode<->float conversions.  Every
+# routine here is freestanding: it builds and links with no AMIX libc.  Built
+# one object per function with -DL<name>, mirroring the stock gcc LIB2FUNCS
+# rule, but through the installed wrapper compiler so the SGS->GNU-as fixups are
+# applied.  (The float->unsigned and XFmode fix routines are omitted because
+# nothing built here needs them.  They also used to be impossible to build at
+# all -- GNU as 2.8.1 rejected the SGS fcmp operand order they emit -- but the
+# compare fixup in fix_asm now handles that, so _fixunsdfsi, _fixunssfsi,
+# _fixunsxfsi, _fixunsxfdi, _fixxfdi and _fixsfdi all compile cleanly should
+# they ever be wanted.)
+LIBGCC_A := $(GCC_LIBDIR)/libgcc.a
+LIBGCC2_BUILD_DIR := $(GCC_BUILD)/amix-libgcc
+LIBGCC2_BUILD_CFLAGS ?= -O2
+LIBGCC2_BUILD_INCLUDES := -I$(GCC_BUILD) -I$(GCC_SRC) -I$(GCC_SRC)/config -I$(GCC_SRC)/ginclude
+LIBGCC2_FUNCS := _muldi3 _divdi3 _moddi3 _udivdi3 _umoddi3 _negdi2 \
+	_lshrdi3 _ashldi3 _ashrdi3 _udiv_w_sdiv _udivmoddi4 _cmpdi2 _ucmpdi2 \
+	_floatdidf _floatdisf _floatdixf _fixunsdfdi _fixdfdi _fixunssfdi \
+	__gcc_bcmp _clear_cache _shtab _trampoline
+
+.PHONY: all help deps-hint deps download extract binutils install-binutils sysroot validate-sysroot check-runtime github-safety-check gcc install-gcc gcc-full install-gcc-wrapper install-target-ar libgcc install-libgcc env test-random test-hello test-uint64 test-divmod test-float test-fcmp print-vars clean distclean
+
+all: install-binutils sysroot install-gcc install-gcc-wrapper install-target-ar install-libgcc env
 
 help:
 	@echo "AMIX cross-toolchain bootstrap"
@@ -335,6 +362,62 @@ install-gcc-wrapper: install-gcc
 	sed 's/@TARGET@/$(TARGET)/g' $(HERE)/amix-gcc-wrapper.sh > $(PREFIX)/bin/$(TARGET)-gcc
 	chmod 755 $(PREFIX)/bin/$(TARGET)-gcc
 
+# Replace the fortify-aborting binutils 2.8.1 ar/ranlib with thin wrappers that
+# delegate to the host ar/ranlib (see amix-ar-wrapper.sh for the rationale).
+# The shipped ar/ranlib are hardlinked to $(TARGET)/bin/ar etc., so remove the
+# target path first to break the link before writing the wrapper in its place.
+# Self-contained (the wrappers only need the host ar/ranlib); `all' sequences
+# this after install-binutils so it overwrites the binutils-installed ar.
+install-target-ar:
+	@hostar="$$(command -v $(HOST_AR) 2>/dev/null)"; \
+	hostranlib="$$(command -v $(HOST_RANLIB) 2>/dev/null)"; \
+	test -n "$$hostar" || { echo "Host '$(HOST_AR)' not found in PATH"; exit 1; }; \
+	test -n "$$hostranlib" || { echo "Host '$(HOST_RANLIB)' not found in PATH"; exit 1; }; \
+	mkdir -p "$(PREFIX)/bin"; \
+	for tool in ar ranlib; do \
+		dest="$(PREFIX)/bin/$(TARGET)-$$tool"; \
+		sed -e 's/@TARGET@/$(TARGET)/g' \
+		    -e "s|@HOST_AR@|$$hostar|g" \
+		    -e "s|@HOST_RANLIB@|$$hostranlib|g" \
+		    "$(HERE)/amix-ar-wrapper.sh" > "$$dest.amix-tmp"; \
+		rm -f "$$dest"; \
+		mv "$$dest.amix-tmp" "$$dest"; \
+		chmod 755 "$$dest"; \
+		echo "Installed $$dest (delegates to host $$tool)"; \
+	done
+
+# Build libgcc.a from the freestanding libgcc2 helper routines.  One object per
+# function (-DL<name>), compiled through the installed wrapper compiler so the
+# assembler fixups apply, then archived with the (now working) target ar.
+# libgcc2's soft-arithmetic helpers are freestanding, so this needs no AMIX
+# sysroot/libc; it only requires the wrapper compiler + working ar to be
+# installed already.  `all' sequences install-gcc-wrapper before this; the
+# guards below give a clear error if libgcc is built before that.
+libgcc: install-target-ar
+	@test -f "$(GCC_SRC)/libgcc2.c" || { echo "Missing $(GCC_SRC)/libgcc2.c; run 'make extract'"; exit 1; }
+	@test -f "$(GCC_BUILD)/tm.h" || { echo "Missing $(GCC_BUILD)/tm.h; run 'make install-gcc' first"; exit 1; }
+	@grep -q 'amix gcc wrapper' "$(TARGET_CC)" 2>/dev/null || { \
+		echo "$(TARGET_CC) is not the AMIX wrapper compiler; run 'make install-gcc-wrapper' first"; exit 1; }
+	rm -rf $(LIBGCC2_BUILD_DIR)
+	mkdir -p $(LIBGCC2_BUILD_DIR)
+	@set -e; objs=""; \
+	for name in $(LIBGCC2_FUNCS); do \
+		echo "libgcc2: $$name"; \
+		PATH="$(PATH_FOR_BUILD)" "$(TARGET_CC)" $(LIBGCC2_BUILD_CFLAGS) $(LIBGCC2_BUILD_INCLUDES) \
+			-DL$$name -c "$(GCC_SRC)/libgcc2.c" -o "$(LIBGCC2_BUILD_DIR)/$$name.o"; \
+		objs="$$objs $$name.o"; \
+	done; \
+	cd "$(LIBGCC2_BUILD_DIR)" && rm -f libgcc.a && \
+		"$(TARGET_AR)" rc libgcc.a $$objs && \
+		"$(TARGET_RANLIB)" libgcc.a
+	@echo "Built $(LIBGCC2_BUILD_DIR)/libgcc.a"
+
+install-libgcc: libgcc
+	mkdir -p $(GCC_LIBDIR)
+	cp $(LIBGCC2_BUILD_DIR)/libgcc.a $(LIBGCC_A)
+	"$(TARGET_RANLIB)" $(LIBGCC_A)
+	@echo "Installed $(LIBGCC_A)"
+
 env:
 	@mkdir -p $(BUILDDIR)
 	@printf '%s\n' '# Source this file before cross-compiling for AMIX.' > $(BUILDDIR)/env.sh
@@ -362,6 +445,217 @@ test-hello: all check-runtime
 	printf '%s\n' '#include <stdio.h>' 'int main(void) { puts("hello from AMIX cross"); return 0; }' > $(BUILDDIR)/test/hello.c
 	AMIX_SYSROOT="$(SYSROOT)" AMIX_CRT_DIR="$(AMIX_CRT_DIR)" $(TARGET_CC) $(CPUFLAGS) -o $(BUILDDIR)/test/hello $(BUILDDIR)/test/hello.c
 	file $(BUILDDIR)/test/hello
+
+# End-to-end proof that a program using 64-bit integer arithmetic both
+# compiles and links: the division/modulo/shift below force calls to
+# __udivdi3/__umoddi3/__lshrdi3, which must resolve from the installed
+# libgcc.a.  Requires the AMIX crt objects + libc.so.1 in the sysroot (like
+# test-hello).  A successful link with no unresolved symbols is the proof.
+test-uint64: install-libgcc env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Forces the 64-bit soft-integer helpers __udivdi3/__umoddi3/__lshrdi3. */' \
+		'unsigned long long udiv(unsigned long long a, unsigned long long b) { return a / b; }' \
+		'unsigned long long umod(unsigned long long a, unsigned long long b) { return a % b; }' \
+		'unsigned long long shr (unsigned long long a, int n)                { return a >> n; }' \
+		'int main(void) {' \
+		'	return (int)(udiv(1000000000000ULL, 7ULL) + umod(1000003ULL, 7ULL)' \
+		'	           + shr((unsigned long long) 1 << 40, 8));' \
+		'}' \
+		> $(BUILDDIR)/test/uint64.c
+	$(TARGET_CC) $(CPUFLAGS) -o $(BUILDDIR)/test/uint64 $(BUILDDIR)/test/uint64.c
+	file $(BUILDDIR)/test/uint64
+	@echo "64-bit helpers pulled from libgcc.a (expect T, defined):"
+	$(PREFIX)/bin/$(TARGET)-nm $(BUILDDIR)/test/uint64 | grep -E '__udivdi3|__umoddi3|__lshrdi3'
+
+# Regression test for the SGS "tdivs.l/tdivu.l <ea>,%dR:%dQ" assembler fixup
+# (see fix_asm in amix-gcc-wrapper.sh).  gcc emits the 68020 32/32 divide-with-
+# remainder for every variable-divisor "%"/"/"; GNU as 2.8.1 mis-assembles the
+# raw SGS spelling as the 64-bit-dividend "DIVS.L Dr:Dq" (SIZE bit set), which
+# overflows and leaves the operands unchanged -> wrong results.  The wrapper
+# rewrites it to "divsl.l"/"divul.l" (32-bit dividend, 32r:32q).  This target
+# compiles signed+unsigned "%"/"/" through the installed wrapper at both the
+# -O0 and -O register shapes and checks the *object code*: every emitted divide
+# must disassemble as the 32-bit-dividend form ("divsll"/"divull", SIZE clear,
+# both registers preserved) and NONE as the broken 64-bit form ("divsl"/"divul").
+#
+# Failure mode against the PRE-FIX wrapper (proof this test bites): the modulo
+# ops assemble to the 64-bit "divsl"/"divul" form, so the "no broken form" check
+# below fails; at -O0 the divides do too, so the "correct form present" check
+# also fails.  A pass therefore requires the fixup to be installed.
+test-divmod: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Variable-divisor signed+unsigned % and / force gcc to emit the' \
+		'   68020 32/32 divide-with-remainder (SGS tdivs.l/tdivu.l ea,%dR:%dQ).' \
+		'   Known answers on target: smod/umod(351,151)=49, sdiv/udiv(351,151)=2.' \
+		'   The objdump check in the Makefile is what actually gates the test. */' \
+		'int          smod(int a, int b)                   { return a % b; }' \
+		'unsigned int umod(unsigned int a, unsigned int b) { return a % b; }' \
+		'int          sdiv(int a, int b)                   { return a / b; }' \
+		'unsigned int udiv(unsigned int a, unsigned int b) { return a / b; }' \
+		'int main(void) {' \
+		'	return smod(351,151) + (int)umod(351u,151u)' \
+		'	     + sdiv(351,151) + (int)udiv(351u,151u); /* = 102 */' \
+		'}' \
+		> $(BUILDDIR)/test/divmod.c
+	@set -e; status=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/divmod$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/divmod.c; \
+		dis="$$($(PREFIX)/bin/$(TARGET)-objdump -d "$$obj")"; \
+		echo "==== $$opt ===="; echo "$$dis" | grep -Ew 'divsl|divul|divsll|divull' || true; \
+		if ! printf '%s\n' "$$dis" | grep -Ewq 'divsll|divull'; then \
+			echo "FAIL$$opt: no 32-bit-dividend divide (divsll/divull) emitted"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Ewq 'divsl|divul'; then \
+			echo "FAIL$$opt: broken 64-bit-dividend form (divsl/divul) still emitted"; status=1; \
+		fi; \
+	done; \
+	test $$status -eq 0 && echo "test-divmod PASS: both registers preserved, no 64-bit-dividend form"
+
+# Regression test for the SGS "fsgldiv.s/fsglmul.s %fpN,%fpM" assembler fixup
+# (see fix_asm in amix-gcc-wrapper.sh).  gcc spells single-precision FP multiply
+# and divide as the 68881/68882 "fsglmul"/"fsgldiv"; config/m68k/amix.h defines
+# FSGLMUL_USE_S/FSGLDIV_USE_S, so the REGISTER-TO-REGISTER form comes out with an
+# SGS ".s" suffix.  GNU as 2.8.1 requires ".x" there: with both operands in FPU
+# registers the data is 80-bit extended by definition, and the single-precision
+# rounding is encoded in the "sgl" of the mnemonic, not in the suffix.
+#
+# This target compiles float "/" and "*" through the installed wrapper at both
+# -O0 and -O and checks the *object code* for BOTH halves of the fix:
+#   (a) the register-to-register ops became the ".x" form, i.e. they disassemble
+#       as "fsgldivx %fpN,%fpM" / "fsglmulx %fpN,%fpM"; and
+#   (b) the legal single-precision NON-register-source ops were NOT touched --
+#       a memory source ("fsgldivs %fp@(N),%fpM") and a data-register source
+#       ("fsglmuls %dN,%fpM") are both valid and encode a genuinely different
+#       instruction (R/M=1, source format "single") from the ".x" register form
+#       (R/M=0), so rewriting them would be a miscompile.  gcc emits all three
+#       shapes from the source below.
+#
+# Failure mode against the PRE-FIX wrapper (proof this test bites): it fails at
+# ASSEMBLY time, before any objdump check runs --
+#   Error: operands mismatch -- statement `fsgldiv.s %fp1,%fp0' ignored
+# which is exactly why cross-building C that divides or multiplies "float"
+# previously needed a -Dfloat=double workaround.  A too-greedy rewrite that also
+# hit the memory/data-register forms fails check (b) instead.
+test-float: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Single-precision multiply/divide in three operand shapes.' \
+		'   rr_*  : both operands end up in FPU registers -- the form GNU as' \
+		'           rejects when it carries the SGS ".s" suffix (the bug).' \
+		'   mem_* : single-precision MEMORY source -- ".s" is legal and must' \
+		'           NOT be rewritten.' \
+		'   dreg  : single-precision DATA-REGISTER source -- likewise legal.' \
+		'   Deliberately no float COMPARISONS: the SGS fcmp operand order is a' \
+		'   separate fixup with its own gate, "make test-fcmp". */' \
+		'float rr_div (float a, float b) { float t = a + b; return (a * t) / (b * t); }' \
+		'float rr_mul (float a, float b) { float t = a + b; return (a * t) * (b * t); }' \
+		'float mem_div(float a, float b) { return a / b; }' \
+		'float mem_mul(float a, float b) { return a * b; }' \
+		'float dreg   (float a, float b) { return (a * b) * (a + b); }' \
+		'int main(void) { return (int)(rr_div(6.0f, 3.0f) + rr_mul(1.0f, 1.0f)' \
+		'                            + mem_div(8.0f, 4.0f) + mem_mul(2.0f, 3.0f)' \
+		'                            + dreg(1.0f, 2.0f)); }' \
+		> $(BUILDDIR)/test/float.c
+	@set -e; status=0; sawdreg=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/float$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/float.c; \
+		dis="$$($(PREFIX)/bin/$(TARGET)-objdump -d "$$obj")"; \
+		echo "==== $$opt ===="; \
+		printf '%s\n' "$$dis" | grep -oE 'fsgl(div|mul)[sx][ \t]+[^ ]+' | sort | uniq -c || true; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsgldivx[ \t]+%fp[0-7],%fp[0-7]'; then \
+			echo "FAIL$$opt: no register-to-register fsgldiv in the .x form"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsglmulx[ \t]+%fp[0-7],%fp[0-7]'; then \
+			echo "FAIL$$opt: no register-to-register fsglmul in the .x form"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsgldivs[ \t]+%fp@\('; then \
+			echo "FAIL$$opt: legal memory-source fsgldiv.s was rewritten away"; status=1; \
+		fi; \
+		if ! printf '%s\n' "$$dis" | grep -Eq 'fsglmuls[ \t]+%fp@\('; then \
+			echo "FAIL$$opt: legal memory-source fsglmul.s was rewritten away"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Eq 'fsgl(div|mul)s[ \t]+%fp[0-7],'; then \
+			echo "FAIL$$opt: an FPU-register-source op kept the illegal .s suffix"; status=1; \
+		fi; \
+		if printf '%s\n' "$$dis" | grep -Eq 'fsglmuls[ \t]+%d[0-7],%fp[0-7]'; then sawdreg=1; fi; \
+	done; \
+	test $$sawdreg -eq 1 || { echo "FAIL: legal data-register-source fsglmul.s never seen"; status=1; }; \
+	test $$status -eq 0 && echo "test-float PASS: reg-reg fsgl ops are .x, memory/data-register .s forms untouched"
+
+# Regression test for the SGS compare-operand-order fixup as it applies to the
+# 68881 "fcmp" (see fix_asm in amix-gcc-wrapper.sh).  config/m68k/sgs.h defines
+# SGS_CMP_ORDER, so gcc prints both compare operands the other way round from
+# what GNU as expects.  The wrapper swaps them back.  Two distinct failure modes
+# hide behind this, and this target has to catch BOTH:
+#
+#   FP register vs memory  -- GNU as needs an FPU register as the DESTINATION,
+#     so the SGS spelling is rejected outright and the build stops:
+#       Error: operands mismatch -- statement `fcmp.d %fp0,16(%fp)' ignored
+#
+#   FP register vs FP register -- the reversed spelling is still VALID syntax,
+#     so it assembles silently to a different encoding ("fcmp.x %fp2,%fp0" is
+#     f200 0838, "fcmp.x %fp0,%fp2" is f200 0138).  FCMP computes destination
+#     minus source, so the wrong order makes every following fbgt/fsgt test the
+#     REVERSED relation, with no diagnostic anywhere.  Same severity class as
+#     the tdivs defect: cross-built code that looks fine and computes garbage.
+#
+# Checking the sense mechanically, without being able to RUN the code, needs an
+# invariant that does not depend on register allocation or stack offsets.  Each
+# function below compares a MULTIPLY result against something else, C-source
+# left-hand side first ("x > y" where x = a * b).  Because FCMP computes
+# <second operand> minus <first operand>, a correctly ordered fcmp must name the
+# register holding the multiply result as its SECOND operand.  So the invariant
+# is simply: the destination of the fcmp is the register the fmul wrote.  That
+# holds at -O0 (values reloaded from the stack) and at -O (values kept in FPU
+# registers) alike, and it is exactly what breaks when the operands are reversed.
+#
+# Failure mode against a wrapper WITHOUT the fcmp half of the fixup (proof this
+# test bites): rm_* fail to assemble with the "operands mismatch" above, and the
+# rr_* pair assemble cleanly but report the fcmp destination as the fadd result
+# rather than the fmul result -- a MISMATCH line and a non-zero exit.
+test-fcmp: install-gcc-wrapper env
+	mkdir -p $(BUILDDIR)/test
+	printf '%s\n' \
+		'/* Every comparison puts a MULTIPLY result on the left of ">", so a' \
+		'   correctly ordered fcmp must carry that register as its SECOND' \
+		'   operand (FCMP computes second minus first).' \
+		'   rr_* keep both values in FPU registers -> the SILENT failure shape.' \
+		'   rm_* compare against a memory operand   -> the LOUD failure shape. */' \
+		'int rr_d(double a, double b){ double x = a * b, y = a + b; return x > y; }' \
+		'int rr_f(float  a, float  b){ float  x = a * b, y = a + b; return x > y; }' \
+		'int rm_d(double a, double b){ double x = a * b;            return x > b; }' \
+		'int rm_f(float  a, float  b){ float  x = a * b;            return x > b; }' \
+		'int main(void) { return rr_d(3.0, 2.0) + rr_f(3.0f, 2.0f)' \
+		'                      + rm_d(3.0, 2.0) + rm_f(3.0f, 2.0f); }' \
+		> $(BUILDDIR)/test/fcmp.c
+	@set -e; status=0; \
+	for opt in -O0 -O; do \
+		obj="$(BUILDDIR)/test/fcmp$$opt.o"; \
+		$(TARGET_CC) $(CPUFLAGS) $$opt -c -o "$$obj" $(BUILDDIR)/test/fcmp.c; \
+		echo "==== $$opt ===="; \
+		$(PREFIX)/bin/$(TARGET)-objdump -d "$$obj" | awk ' \
+			/^[0-9a-f]+ <.*>:/ { fn=$$2; gsub(/[<>:]/,"",fn); mul=""; next } \
+			/f(sgl)?mul[sdx]/  { n=split($$0,p,","); mul=p[n]; sub(/[ \t]+$$/,"",mul) } \
+			/fcmp[sdx]/ { \
+				n=split($$0,p,","); d=p[n]; sub(/[ \t]+$$/,"",d); \
+				src=$$0; sub(/.*fcmp[sdx][ \t]+/,"",src); sub(/,.*/,"",src); \
+				if (mul == "" || d != mul) { \
+					printf "  FAIL %s: fcmp destination %s is not the fmul result %s (comparison reversed)\n", fn, d, mul; bad=1 \
+				} else { \
+					printf "  ok   %s: fcmp %s,%s computes (fmul result %s) - src\n", fn, src, d, d \
+				} \
+				seen++ \
+			} \
+			END { \
+				if (seen != 4) { printf "  FAIL: expected 4 fcmp sites, saw %d\n", seen; bad=1 } \
+				exit bad ? 1 : 0 \
+			}' || status=1; \
+	done; \
+	test $$status -eq 0 && echo "test-fcmp PASS: compare operands in GNU order, branch sense matches the C source"
 
 clean:
 	rm -rf $(BUILDDIR)
