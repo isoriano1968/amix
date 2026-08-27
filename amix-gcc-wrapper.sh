@@ -86,6 +86,46 @@ fix_asm()
 	# "%fp[0-7]" match cannot mistake "12(%fp)" for an FPU register.
 	perl -pi -e 's{^(\s*)fsgl(div|mul)\.s(\s+%fp[0-7]\s*,\s*%fp[0-7])(\s*)$}{$1fsgl$2.x$3$4}' "$1"
 
+	# Bit-field operand: gcc 2.7.2.3 copies an inline "asm" template into its
+	# output verbatim, so hand-written m68k assembly that spells the bit-field
+	# offset and width the Motorola way -- "bfffo %d3{#0:#32},%d2", which is
+	# how portable m68k C writes it (NetBSD's soft-FPU fpu_subr.c, for one) --
+	# reaches the assembler unchanged.  On this target "#" is not an immediate
+	# prefix at all: the SGS immediate prefix is "&", and GNU as 2.8.1 lists
+	# "#" in line_comment_chars (gas/config/tc-m68k.c), so its scrubber drops
+	# everything from the "#" to end of line before the m68k parser sees it --
+	# the same way it silently eats a stray "moveq #1,%d0":
+	#
+	#   Error: Missing operand
+	#   Error: operands mismatch -- statement `bfffo %d3{' ignored
+	#
+	# Rewrite the "#" inside the bit-field braces to "&".  That is exactly what
+	# gcc's own bit-field patterns already print -- "bfextu (%a0){&0:&5},%d0"
+	# assembles today -- so the repaired line is spelled the way the rest of the
+	# file is.  "&" rather than a bare number: GNU as needs a prefix as soon as
+	# the offset or width is a symbol.  Its operand splitter only breaks at the
+	# ":" when the next character is one of a small set (the digits, "&", "#",
+	# a register prefix, "(", "@"), so "{&BOFF:&WID}" assembles while the bare
+	# "{BOFF:WID}" is a "Bad expression".
+	#
+	# Only what is between the braces is touched, so "#APP"/"#NO_APP" and any
+	# other "#" on the line are left alone, and the register form "{%d0:%d1}"
+	# and the already-correct "{&0:&5}" pass through unchanged.  All eight m68k
+	# bit-field mnemonics are covered.  gcc's own codegen emits seven of them
+	# (config/m68k/m68k.md) and already gets the prefix right, so in practice
+	# this only ever fires on inline asm -- but any of the eight can arrive that
+	# way, and bfffo, which gcc has no pattern for at all, arrives ONLY that
+	# way.  Verify with objdump: offset and width must survive as bits 10:6 and
+	# 4:0 of the extension word with the Do/Dw register-select bits clear (a
+	# width of 32 encodes as 0).  ("make test-bitfield" gates this.)
+	perl -pi -e '
+		s{^(\s*bf(?:chg|clr|exts|extu|ffo|ins|set|tst)\s[^\n]*?\{)([^\n{}]*)(\})}{
+			my ($head, $field, $tail) = ($1, $2, $3);
+			$field =~ s/[#]/&/g;
+			"$head$field$tail";
+		}egm;
+	' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
 
 	# Restore Motorola/GNU operand order for compares.  config/m68k/sgs.h
