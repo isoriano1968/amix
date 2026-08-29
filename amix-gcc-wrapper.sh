@@ -407,14 +407,20 @@ for cand in "$prefix"/lib/gcc-lib/"$target"/*/libgcc.a; do
 done
 
 resolved_libs=()
-if test "${#libs[@]}" -eq 0; then
-	libs=(c)
-fi
 for lib in "${libs[@]}"; do
 	# -lgcc is satisfied by the libgcc.a appended to the link below.
 	test "$lib" = gcc && continue
 	resolved_libs+=("$(resolve_lib "$lib")")
 done
+# fix (linking): always link libc, at the END of the library list.  A stock gcc
+# driver pulls libc in from its specs regardless of the user's -l flags; this
+# wrapper hand-rolls ld, and it used to add libc ONLY when no -l was given at
+# all.  So a lone "-lfoo" dropped libc from the link entirely, and the first
+# symbols left undefined were crt1.o's own atexit/exit/_environ/__fpstart --
+# which reads as a broken toolchain rather than a missing -lc.  Appending it
+# after the user's libraries (so their libc references still resolve) means an
+# explicit trailing -lc is no longer required; a redundant one is harmless.
+resolved_libs+=("$(resolve_lib c)")
 
 for crt in crt1.o crti.o crtn.o; do
 	test -f "$crt_dir/$crt" || {
