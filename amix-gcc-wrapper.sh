@@ -258,12 +258,29 @@ resolve_lib()
 
 has_c=no
 has_S=no
+has_E=no
 for arg in "$@"; do
 	case "$arg" in
 		-c) has_c=yes ;;
 		-S) has_S=yes ;;
+		-E) has_E=yes ;;
 	esac
 done
+
+# fix (preprocessing): -E needs only the real preprocessor and the target
+# include path.  fix_asm exists to repair generated ASSEMBLY, and -E produces
+# none, so it is safe to hand the whole command line straight to the real cross
+# compiler with the same include path a compile uses (common_cflags).  Without
+# this, -E is unrecognised here and falls through to the parse loop's catch-all
+# below, which files any unknown dash-argument as an *ld* flag: "gcc -E foo.c"
+# then COMPILES AND LINKS foo.c instead of preprocessing it, emitting nothing on
+# stdout.  autoconf's "checking how to run the C preprocessor" step rejects that
+# and silently falls back to the build HOST's /lib/cpp, after which every
+# AC_CHECK_HEADER reads the host's /usr/include and HAVE_* is decided against
+# the wrong headers.  (Same dispatch as -S immediately below.)
+if test "$has_E" = yes; then
+	exec "$real" "${common_cflags[@]}" "$@"
+fi
 
 if test "$has_S" = yes; then
 	exec "$real" "${common_cflags[@]}" "$@"
