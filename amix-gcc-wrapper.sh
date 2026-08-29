@@ -141,6 +141,25 @@ fix_asm()
 			my ($left, $right) = split_operands($ops);
 			defined $right ? "$prefix$right,$left" : "$prefix$ops";
 		}egm;
+		# Rounding-precision opcodes with an FPn source: gcc 2.7.2.3 emits
+		# the size suffix of the original C type (.s/.d), but a register
+		# source is always extended precision and gas rejects anything but
+		# .x.  The value is unaffected -- these opcodes round the RESULT to
+		# the precision named in the mnemonic, whatever the source is called.
+		# FSGLMUL/FSGLDIV are handled by the rule above; this is the
+		# FSxxx/FDxxx family, which gcc emits at -m68040.
+		s{^(\s*f[sd](?:add|sub|mul|div|mov|abs|neg|sqrt))\.[bwlsdp](\s+%fp[0-7],%fp[0-7]\s*)$}{$1.x$2}gm;
+		# ...and this gas knows FSMOV by the short name but not FDMOV, which
+		# it only accepts spelled FDMOVE.  An asymmetry in its opcode table,
+		# not a difference between the instructions.  Must run after the rule
+		# above, which matches on the short spelling.
+		s{^(\s*)fdmov(\.)}{$1fdmove$2}gm;
+		# Two more spellings gas will not take, both from the float-to-int
+		# sequence gcc emits at -m68040: it saves FPCR, sets round-to-zero,
+		# converts and restores.  Suffixless `fmovm` (the register-list form
+		# in prologues) is fine; only the sized control-register form is not.
+		s{^(\s*)fmovm(\.[a-z])}{$1fmovem$2}gm;
+		s{^(\s*mov)(\s+&\d+,%d[0-7]\s*)$}{$1.l$2}gm;
 	' "$1"
 }
 
@@ -154,9 +173,24 @@ compile_one()
 	asmfile="$(mktemp "${TMPDIR:-/tmp}/amix-gcc.XXXXXX.s")"
 	tmpfiles+=("$asmfile")
 
+	# Assemble for whatever architecture the compile asked for.  This used to
+	# be hardcoded to -m68020, which silently capped the toolchain at 68020
+	# code generation: -m68040 compiles fine and then fails to assemble on
+	# 040-only opcodes.  That matters for more than exotica.  gcc at -m68020
+	# emits FSGLMUL/FSGLDIV for single-precision multiply and divide, and
+	# neither is implemented in the 68060's FPU -- every one of them traps into
+	# the FPSP and is emulated.  At -m68040 gcc emits FSMUL/FSDIV instead,
+	# which both the 040 and the 060 execute in hardware.
+	local asarch=-m68020
+	for a in "$@"; do
+		case "$a" in
+			-m68030|-m68040|-m68060) asarch="$a" ;;
+		esac
+	done
+
 	"$real" -S "${common_cflags[@]}" "$@" "$src" -o "$asmfile"
 	fix_asm "$asmfile"
-	"$as" -m68020 -o "$obj" "$asmfile"
+	"$as" "$asarch" -o "$obj" "$asmfile"
 }
 
 resolve_lib()
