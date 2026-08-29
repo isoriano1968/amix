@@ -289,6 +289,7 @@ fi
 compile_flags=()
 sources=()
 objects=()
+archives=()
 ld_flags=()
 lib_dirs=()
 libs=()
@@ -332,8 +333,21 @@ while test $# -gt 0; do
 		*.c)
 			sources+=("$arg")
 			;;
-		*.o|*.a|*.so|*.so.[0-9]*)
+		*.o)
 			objects+=("$arg")
+			;;
+		# fix (linking): a static archive or shared library named directly on the
+		# command line must be linked AFTER the objects that reference it.  The .c
+		# sources are compiled and their objects APPENDED to objects[] further
+		# down, so a .a/.so left in objects[] here would sort before them:
+		# "gcc prog.c libfoo.a" would link as "libfoo.a prog.o", and single-pass
+		# ld, meeting the archive while nothing is yet undefined, would pull in no
+		# members and every symbol in it would come back undefined.  Collect these
+		# separately and place them past the objects on the link line.  Plain .o
+		# relocatables stay in objects[] (they carry symbols, not just satisfy
+		# references, so their position among the objects does not matter).
+		*.a|*.so|*.so.[0-9]*)
+			archives+=("$arg")
 			;;
 		*)
 			if [[ "$arg" == -* ]]; then
@@ -345,7 +359,7 @@ while test $# -gt 0; do
 	esac
 done
 
-for input in "${sources[@]}" "${objects[@]}"; do
+for input in "${sources[@]}" "${objects[@]}" "${archives[@]}"; do
 	if test -n "$input" && test "$out" = "$input"; then
 		echo "amix gcc wrapper: refusing to overwrite input file '$input'" >&2
 		exit 1
@@ -415,7 +429,7 @@ done
 # a stock gcc driver, which appends -lgcc at the end of the link.
 exec "$ld" -o "$out" \
 	"$crt_dir/crt1.o" "$crt_dir/crti.o" \
-	"${objects[@]}" "${ld_flags[@]}" \
+	"${objects[@]}" "${archives[@]}" "${ld_flags[@]}" \
 	"${resolved_libs[@]}" \
 	${libgcc_a:+"$libgcc_a"} \
 	"$crt_dir/crtn.o"
