@@ -86,6 +86,46 @@ fix_asm()
 	# "%fp[0-7]" match cannot mistake "12(%fp)" for an FPU register.
 	perl -pi -e 's{^(\s*)fsgl(div|mul)\.s(\s+%fp[0-7]\s*,\s*%fp[0-7])(\s*)$}{$1fsgl$2.x$3$4}' "$1"
 
+	# Bit-field operand: gcc 2.7.2.3 copies an inline "asm" template into its
+	# output verbatim, so hand-written m68k assembly that spells the bit-field
+	# offset and width the Motorola way -- "bfffo %d3{#0:#32},%d2", which is
+	# how portable m68k C writes it (NetBSD's soft-FPU fpu_subr.c, for one) --
+	# reaches the assembler unchanged.  On this target "#" is not an immediate
+	# prefix at all: the SGS immediate prefix is "&", and GNU as 2.8.1 lists
+	# "#" in line_comment_chars (gas/config/tc-m68k.c), so its scrubber drops
+	# everything from the "#" to end of line before the m68k parser sees it --
+	# the same way it silently eats a stray "moveq #1,%d0":
+	#
+	#   Error: Missing operand
+	#   Error: operands mismatch -- statement `bfffo %d3{' ignored
+	#
+	# Rewrite the "#" inside the bit-field braces to "&".  That is exactly what
+	# gcc's own bit-field patterns already print -- "bfextu (%a0){&0:&5},%d0"
+	# assembles today -- so the repaired line is spelled the way the rest of the
+	# file is.  "&" rather than a bare number: GNU as needs a prefix as soon as
+	# the offset or width is a symbol.  Its operand splitter only breaks at the
+	# ":" when the next character is one of a small set (the digits, "&", "#",
+	# a register prefix, "(", "@"), so "{&BOFF:&WID}" assembles while the bare
+	# "{BOFF:WID}" is a "Bad expression".
+	#
+	# Only what is between the braces is touched, so "#APP"/"#NO_APP" and any
+	# other "#" on the line are left alone, and the register form "{%d0:%d1}"
+	# and the already-correct "{&0:&5}" pass through unchanged.  All eight m68k
+	# bit-field mnemonics are covered.  gcc's own codegen emits seven of them
+	# (config/m68k/m68k.md) and already gets the prefix right, so in practice
+	# this only ever fires on inline asm -- but any of the eight can arrive that
+	# way, and bfffo, which gcc has no pattern for at all, arrives ONLY that
+	# way.  Verify with objdump: offset and width must survive as bits 10:6 and
+	# 4:0 of the extension word with the Do/Dw register-select bits clear (a
+	# width of 32 encodes as 0).  ("make test-bitfield" gates this.)
+	perl -pi -e '
+		s{^(\s*bf(?:chg|clr|exts|extu|ffo|ins|set|tst)\s[^\n]*?\{)([^\n{}]*)(\})}{
+			my ($head, $field, $tail) = ($1, $2, $3);
+			$field =~ s/[#]/&/g;
+			"$head$field$tail";
+		}egm;
+	' "$1"
+
 	perl -pi -e 's/^(\s*\.lcomm\s+[^,]+,[^,]+),\d+\s*$/$1\n/' "$1"
 
 	# Restore Motorola/GNU operand order for compares.  config/m68k/sgs.h
@@ -218,12 +258,29 @@ resolve_lib()
 
 has_c=no
 has_S=no
+has_E=no
 for arg in "$@"; do
 	case "$arg" in
 		-c) has_c=yes ;;
 		-S) has_S=yes ;;
+		-E) has_E=yes ;;
 	esac
 done
+
+# fix (preprocessing): -E needs only the real preprocessor and the target
+# include path.  fix_asm exists to repair generated ASSEMBLY, and -E produces
+# none, so it is safe to hand the whole command line straight to the real cross
+# compiler with the same include path a compile uses (common_cflags).  Without
+# this, -E is unrecognised here and falls through to the parse loop's catch-all
+# below, which files any unknown dash-argument as an *ld* flag: "gcc -E foo.c"
+# then COMPILES AND LINKS foo.c instead of preprocessing it, emitting nothing on
+# stdout.  autoconf's "checking how to run the C preprocessor" step rejects that
+# and silently falls back to the build HOST's /lib/cpp, after which every
+# AC_CHECK_HEADER reads the host's /usr/include and HAVE_* is decided against
+# the wrong headers.  (Same dispatch as -S immediately below.)
+if test "$has_E" = yes; then
+	exec "$real" "${common_cflags[@]}" "$@"
+fi
 
 if test "$has_S" = yes; then
 	exec "$real" "${common_cflags[@]}" "$@"
@@ -232,6 +289,7 @@ fi
 compile_flags=()
 sources=()
 objects=()
+archives=()
 ld_flags=()
 lib_dirs=()
 libs=()
@@ -275,8 +333,21 @@ while test $# -gt 0; do
 		*.c)
 			sources+=("$arg")
 			;;
-		*.o|*.a|*.so|*.so.[0-9]*)
+		*.o)
 			objects+=("$arg")
+			;;
+		# fix (linking): a static archive or shared library named directly on the
+		# command line must be linked AFTER the objects that reference it.  The .c
+		# sources are compiled and their objects APPENDED to objects[] further
+		# down, so a .a/.so left in objects[] here would sort before them:
+		# "gcc prog.c libfoo.a" would link as "libfoo.a prog.o", and single-pass
+		# ld, meeting the archive while nothing is yet undefined, would pull in no
+		# members and every symbol in it would come back undefined.  Collect these
+		# separately and place them past the objects on the link line.  Plain .o
+		# relocatables stay in objects[] (they carry symbols, not just satisfy
+		# references, so their position among the objects does not matter).
+		*.a|*.so|*.so.[0-9]*)
+			archives+=("$arg")
 			;;
 		*)
 			if [[ "$arg" == -* ]]; then
@@ -288,7 +359,7 @@ while test $# -gt 0; do
 	esac
 done
 
-for input in "${sources[@]}" "${objects[@]}"; do
+for input in "${sources[@]}" "${objects[@]}" "${archives[@]}"; do
 	if test -n "$input" && test "$out" = "$input"; then
 		echo "amix gcc wrapper: refusing to overwrite input file '$input'" >&2
 		exit 1
@@ -336,14 +407,20 @@ for cand in "$prefix"/lib/gcc-lib/"$target"/*/libgcc.a; do
 done
 
 resolved_libs=()
-if test "${#libs[@]}" -eq 0; then
-	libs=(c)
-fi
 for lib in "${libs[@]}"; do
 	# -lgcc is satisfied by the libgcc.a appended to the link below.
 	test "$lib" = gcc && continue
 	resolved_libs+=("$(resolve_lib "$lib")")
 done
+# fix (linking): always link libc, at the END of the library list.  A stock gcc
+# driver pulls libc in from its specs regardless of the user's -l flags; this
+# wrapper hand-rolls ld, and it used to add libc ONLY when no -l was given at
+# all.  So a lone "-lfoo" dropped libc from the link entirely, and the first
+# symbols left undefined were crt1.o's own atexit/exit/_environ/__fpstart --
+# which reads as a broken toolchain rather than a missing -lc.  Appending it
+# after the user's libraries (so their libc references still resolve) means an
+# explicit trailing -lc is no longer required; a redundant one is harmless.
+resolved_libs+=("$(resolve_lib c)")
 
 for crt in crt1.o crti.o crtn.o; do
 	test -f "$crt_dir/$crt" || {
@@ -358,7 +435,7 @@ done
 # a stock gcc driver, which appends -lgcc at the end of the link.
 exec "$ld" -o "$out" \
 	"$crt_dir/crt1.o" "$crt_dir/crti.o" \
-	"${objects[@]}" "${ld_flags[@]}" \
+	"${objects[@]}" "${archives[@]}" "${ld_flags[@]}" \
 	"${resolved_libs[@]}" \
 	${libgcc_a:+"$libgcc_a"} \
 	"$crt_dir/crtn.o"
